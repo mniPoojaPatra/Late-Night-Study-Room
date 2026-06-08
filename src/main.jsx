@@ -72,7 +72,8 @@ const useStudyStore = create((set) => ({
   mood: "Rainy Cafe",
   focusMode: false,
   appPage: "dashboard",
-  user: JSON.parse(localStorage.getItem("lnsr-user") || "null"),
+  user: null,
+  sessionLoading: true,
   avatar: localStorage.getItem("lnsr-avatar") || "crescent",
   toast: "",
   tasks: initialTasks,
@@ -91,18 +92,13 @@ const useStudyStore = create((set) => ({
   },
   setUser: (user) => {
     const normalized = user ? { streak: 0, bio: "", focusSessions: 0, tasksCreated: 0, ...user } : null;
-    if (normalized) localStorage.setItem("lnsr-user", JSON.stringify(normalized));
-    else {
-      localStorage.removeItem("lnsr-user");
-      localStorage.removeItem("lnsr-token");
-    }
     set({ user: normalized });
   },
+  setSessionLoading: (loading) => set({ sessionLoading: loading }),
   updateProfile: (updates) =>
     set((state) => ({
       user: (() => {
         const next = { ...state.user, ...updates };
-        localStorage.setItem("lnsr-user", JSON.stringify(next));
         return next;
       })()
     })),
@@ -116,9 +112,25 @@ const useStudyStore = create((set) => ({
         focusSessions: reason === "focus" ? (user.focusSessions || 0) + 1 : user.focusSessions || 0,
         tasksCreated: reason === "task" ? (user.tasksCreated || 0) + 1 : user.tasksCreated || 0
       };
-      localStorage.setItem("lnsr-user", JSON.stringify(next));
       return { user: next };
     }),
+  logout: async () => {
+    try {
+      await fetch(`${API_URL}/api/auth/logout`, { method: "POST", credentials: "include" });
+    } catch { /* ignore network errors on logout */ }
+    set({ user: null });
+  },
+  restoreSession: async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/auth/me`, { credentials: "include" });
+      if (res.ok) {
+        const data = await res.json();
+        set({ user: { streak: 0, bio: "", focusSessions: 0, tasksCreated: 0, ...data.user }, sessionLoading: false });
+        return;
+      }
+    } catch { /* silent fail — no session */ }
+    set({ user: null, sessionLoading: false });
+  },
   addRoom: (name, code) =>
     set((state) => ({
       customRooms: [...state.customRooms, { id: `custom-${Date.now()}`, name, code, live: 1, theme: "Access code room", tone: "Private room" }]
@@ -138,14 +150,28 @@ const useStudyStore = create((set) => ({
 }));
 
 function App() {
-  const { mood, focusMode, toast, setToast, user } = useStudyStore();
+  const { mood, focusMode, toast, setToast, user, sessionLoading, restoreSession } = useStudyStore();
   const [authOpen, setAuthOpen] = useState(false);
+
+  // Restore session from HttpOnly cookie on app mount
+  useEffect(() => {
+    restoreSession();
+  }, [restoreSession]);
 
   useEffect(() => {
     if (!toast) return undefined;
     const timer = window.setTimeout(() => setToast(""), 2600);
     return () => window.clearTimeout(timer);
   }, [toast, setToast]);
+
+  if (sessionLoading) {
+    return (
+      <main className={`app-shell mood-${mood.toLowerCase().replaceAll(" ", "-")}`}>
+        <AmbientBackdrop mood={mood} />
+        <div className="session-loading">Restoring your session...</div>
+      </main>
+    );
+  }
 
   return (
     <main className={`app-shell mood-${mood.toLowerCase().replaceAll(" ", "-")}`}>
@@ -226,7 +252,7 @@ function Nav({ onLogin }) {
               <Avatar size="tiny" />
               {user.name}
             </button>
-            <button className="icon-button" title="Logout" onClick={() => setUser(null)}>
+            <button className="icon-button" title="Logout" onClick={() => useStudyStore.getState().logout()}>
               <LogOut size={18} />
             </button>
           </>
@@ -891,11 +917,11 @@ function AuthModal({ open, onClose }) {
       const response = await fetch(`${API_URL}/api/auth/${mode === "login" ? "login" : "signup"}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify(form)
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.message || "Authentication failed.");
-      localStorage.setItem("lnsr-token", data.token);
+      if (!response.ok) throw new Error(data.error || "Authentication failed.");
       setUser(data.user);
       setPage("dashboard");
       setToast(`${mode === "login" ? "Welcome back" : "Account created"}, ${data.user.name}.`);
@@ -1088,6 +1114,13 @@ function RoomChat({ room, socket, connected }) {
     const parts = text.split(urlRegex);
     return parts.map((part, index) => {
       if (part.match(urlRegex)) {
+        // Validate URL protocol — only allow http and https
+        try {
+          const url = new URL(part);
+          if (url.protocol !== "http:" && url.protocol !== "https:") return part;
+        } catch {
+          return part;
+        }
         return (
           <a key={index} href={part} target="_blank" rel="noopener noreferrer" className="chat-link">
             {part}
